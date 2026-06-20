@@ -3,7 +3,7 @@ FROM ${BASE_IMAGE}
 
 WORKDIR /app
 
-COPY --chmod=755 worker/run_chandra_on_images.py entrypoint.sh README.md /app/
+COPY --chmod=755 worker/run_chandra_on_images.py worker/entrypoint.sh worker/README.md /app/
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
 CMD ["worker"]
