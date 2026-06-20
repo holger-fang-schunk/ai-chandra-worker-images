@@ -1,5 +1,5 @@
-ARG AI_CHANDRA_VLLM_BASE_IMAGE=ai-chandra-vllm-base
-FROM ${AI_CHANDRA_VLLM_BASE_IMAGE}
+ARG BASE_IMAGE=ai-chandra-vllm-base
+FROM ${BASE_IMAGE}
 
 WORKDIR /app
 
