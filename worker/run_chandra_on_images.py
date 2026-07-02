@@ -8,7 +8,10 @@ Modes:
 
 The S3 mode is designed for RunPod spot instances:
 - every page is processed independently
-- outputs are uploaded per page
+- OCR page artifacts are uploaded to output/pages/
+- input page images are copied to output/pages/
+- input source PDFs are copied to output/source/
+- output/_job.json is written for the downstream import-ocr contract
 - a done marker is uploaded last
 - already completed pages are skipped on restart
 - SIGTERM/SIGINT is handled between pages where possible
@@ -23,6 +26,7 @@ import io
 import json
 import os
 import re
+import shutil
 import signal
 import sys
 import time
@@ -398,6 +402,7 @@ def run_local(input_dir: str, output_dir: str, settings: OcrSettings, limit: Opt
 
     client = make_openai_client(settings)
     out_dir = Path(output_dir)
+    pages_out_dir = out_dir / "pages"
     manifest_pages: List[Dict[str, Any]] = []
 
     for idx, img_path in enumerate(pages):
@@ -405,20 +410,27 @@ def run_local(input_dir: str, output_dir: str, settings: OcrSettings, limit: Opt
             print("[local] stop requested before next page.", flush=True)
             break
         print(f"[local] [{idx + 1}/{len(pages)}] {img_path.name}", flush=True)
-        manifest_pages.append(process_image(client, img_path, out_dir, settings, page_num=idx))
+        result = process_image(client, img_path, pages_out_dir, settings, page_num=idx)
+        copied_image = pages_out_dir / img_path.name
+        shutil.copy2(img_path, copied_image)
+        result["copied_input_image"] = str(copied_image)
+        manifest_pages.append(result)
 
-    write_json(
-        out_dir / "run_manifest.json",
-        {
+    manifest_payload = {
+            "version": "ocr-artifacts/v1",
             "mode": "local",
             "created_at_utc": now_utc_iso(),
             "input_dir": input_dir,
             "output_dir": output_dir,
             "settings": settings.to_json(),
+            "pages_dir": str(pages_out_dir),
+            "source_dir": str(out_dir / "source"),
             "pages": manifest_pages,
             "stop_requested": _STOP_REQUESTED,
-        },
-    )
+        }
+
+    write_json(out_dir / "_job.json", manifest_payload)
+    write_json(out_dir / "run_manifest.json", manifest_payload)
 
 
 # -----------------------------
@@ -485,7 +497,42 @@ def content_type_for_path(path: Path) -> Optional[str]:
         return "application/json; charset=utf-8"
     if suffix == ".txt":
         return "text/plain; charset=utf-8"
+    if suffix == ".png":
+        return "image/png"
+    if suffix in {".jpg", ".jpeg"}:
+        return "image/jpeg"
+    if suffix == ".webp":
+        return "image/webp"
+    if suffix == ".pdf":
+        return "application/pdf"
     return None
+
+
+def s3_copy_object(s3: Any, bucket: str, source_key: str, target_key: str, content_type: Optional[str] = None) -> None:
+    extra_args: Dict[str, Any] = {}
+    if content_type:
+        extra_args["ContentType"] = content_type
+        extra_args["MetadataDirective"] = "REPLACE"
+    s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": source_key}, Key=target_key, **extra_args)
+
+
+def copy_input_source_pdfs(s3: Any, bucket: str, input_prefix: str, output_prefix: str) -> Tuple[List[str], List[str]]:
+    input_source_prefix = join_s3_key(input_prefix, "source")
+    output_source_prefix = join_s3_key(output_prefix, "source")
+    pdf_keys = [
+        k for k in s3_list_keys(s3, bucket, input_source_prefix)
+        if Path(k).suffix.lower() == ".pdf"
+    ]
+    copied_keys: List[str] = []
+
+    for source_key in pdf_keys:
+        target_name = "original.pdf" if len(pdf_keys) == 1 else Path(source_key).name
+        target_key = join_s3_key(output_source_prefix, target_name)
+        s3_copy_object(s3, bucket, source_key, target_key, content_type="application/pdf")
+        copied_keys.append(target_key)
+        print(f"[s3] copied source PDF s3://{bucket}/{source_key} -> s3://{bucket}/{target_key}", flush=True)
+
+    return pdf_keys, copied_keys
 
 
 def upload_directory(s3: Any, bucket: str, local_dir: Path, output_prefix: str) -> List[str]:
@@ -570,6 +617,7 @@ def run_s3(
     processed = 0
     skipped = 0
     failed = 0
+    manifest_pages: List[Dict[str, Any]] = []
 
     for idx, key in enumerate(keys, start=1):
         if _STOP_REQUESTED:
@@ -583,6 +631,7 @@ def run_s3(
 
         if not force and s3_key_exists(s3, bucket, done_key):
             skipped += 1
+            manifest_pages.append({"status": "skipped", "input_key": key, "page_id": page_id, "page_num": idx - 1})
             print(f"[s3] [{idx}/{len(keys)}] skip done: {key}", flush=True)
             continue
 
@@ -603,17 +652,22 @@ def run_s3(
             },
         )
 
-        local_input = download_dir / f"{page_id}{Path(key).suffix.lower()}"
-        local_output_dir = work_dir / page_id / "out"
+        local_page_dir = work_dir / page_id
+        local_input = local_page_dir / "in" / Path(key).name
+        local_output_dir = local_page_dir / "out"
         if not keep_local:
-            clean_dir(work_dir / page_id)
+            clean_dir(local_page_dir)
+        local_input.parent.mkdir(parents=True, exist_ok=True)
         local_output_dir.mkdir(parents=True, exist_ok=True)
 
         started_at = now_utc_iso()
         try:
             s3.download_file(bucket, key, str(local_input))
             page_result = process_image(client, local_input, local_output_dir, settings, page_num=idx - 1)
-            page_output_prefix = join_s3_key(output_prefix, page_id)
+            copied_input_image = local_output_dir / Path(key).name
+            shutil.copy2(local_input, copied_input_image)
+            page_result["copied_input_image"] = str(copied_input_image)
+            page_output_prefix = join_s3_key(output_prefix, "pages")
             uploaded_keys = upload_directory(s3, bucket, local_output_dir, page_output_prefix)
 
             done_payload = {
@@ -630,6 +684,15 @@ def run_s3(
             }
             # The done marker is written last. This is the resume boundary.
             s3_put_json(s3, bucket, done_key, done_payload)
+            manifest_pages.append({
+                "status": "done",
+                "input_key": key,
+                "page_id": page_id,
+                "page_num": idx - 1,
+                "output_prefix": page_output_prefix,
+                "uploaded_keys": uploaded_keys,
+                "result": page_result,
+            })
             processed += 1
             print(f"[s3] done marker: s3://{bucket}/{done_key}", flush=True)
 
@@ -653,12 +716,17 @@ def run_s3(
                 try:
                     if local_input.exists():
                         local_input.unlink()
-                    clean_dir(work_dir / page_id)
+                    clean_dir(local_page_dir)
                 except Exception as cleanup_exc:
                     print(f"[s3] cleanup warning: {cleanup_exc}", flush=True)
 
+    source_pdf_input_keys, source_pdf_output_keys = copy_input_source_pdfs(s3, bucket, input_prefix, output_prefix)
+
+    finished_at_utc = now_utc_iso()
+    job_status = "done" if failed == 0 and not _STOP_REQUESTED and not limit_applied and processed + skipped == len(keys) else "partial"
+
     finished_payload = {
-        "finished_at_utc": now_utc_iso(),
+        "finished_at_utc": finished_at_utc,
         "processed": processed,
         "skipped": skipped,
         "failed": failed,
@@ -675,6 +743,36 @@ def run_s3(
         join_s3_key(state_prefix, "worker-finished.json"),
         finished_payload,
     )
+
+    job_manifest = {
+        "version": "ocr-artifacts/v1",
+        "status": job_status,
+        "mode": "s3",
+        "created_at_utc": finished_at_utc,
+        "finished_at_utc": finished_at_utc,
+        "bucket": bucket,
+        "job_prefix": job_prefix,
+        "input_prefix": input_prefix,
+        "input_pages_prefix": join_s3_key(input_prefix, "pages"),
+        "input_source_prefix": join_s3_key(input_prefix, "source"),
+        "output_prefix": output_prefix,
+        "output_pages_prefix": join_s3_key(output_prefix, "pages"),
+        "output_source_prefix": join_s3_key(output_prefix, "source"),
+        "state_prefix": state_prefix,
+        "source_pdf_input_keys": source_pdf_input_keys,
+        "source_pdf_output_keys": source_pdf_output_keys,
+        "processed": processed,
+        "skipped": skipped,
+        "failed": failed,
+        "stop_requested": _STOP_REQUESTED,
+        "total_available_input_images": total_available_input_images,
+        "selected_input_images": len(keys),
+        "limit": limit,
+        "limit_applied": limit_applied,
+        "settings": settings.to_json(),
+        "pages": manifest_pages,
+    }
+    s3_put_json(s3, bucket, join_s3_key(output_prefix, "_job.json"), job_manifest)
 
     if failed == 0 and not _STOP_REQUESTED and not limit_applied and processed + skipped == len(keys):
         job_done_payload = dict(finished_payload)
