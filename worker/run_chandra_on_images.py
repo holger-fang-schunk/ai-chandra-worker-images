@@ -8,10 +8,10 @@ Modes:
 
 The S3 mode is designed for RunPod spot instances:
 - every page is processed independently
-- OCR page artifacts are uploaded to output/pages/
-- input page images are copied to output/pages/
-- input source PDFs are copied to output/source/
-- output/_job.json is written for the downstream import-ocr contract
+- OCR page artifacts are uploaded to output/documents/<ocrDocumentId>/pages/
+- input page images are copied to output/documents/<ocrDocumentId>/pages/
+- input source PDFs are copied to output/documents/<ocrDocumentId>/source/
+- output/_job.json and per-document _job.json files are written for the downstream import-ocr contract
 - a done marker is uploaded last
 - already completed pages are skipped on restart
 - SIGTERM/SIGINT is handled between pages where possible
@@ -98,6 +98,67 @@ def page_id_from_key(input_key: str, input_prefix: str) -> str:
 
 def is_image_key(key: str) -> bool:
     return Path(key).suffix.lower() in IMG_EXTS
+
+
+@dataclass(frozen=True)
+class S3InputPage:
+    key: str
+    ocr_document_id: str
+    page_name: str
+    page_num: int
+
+
+def relative_s3_key(key: str, prefix: str) -> str:
+    prefix = normalize_prefix(prefix)
+    if prefix and key.startswith(prefix + "/"):
+        return key[len(prefix) + 1 :]
+    return key
+
+
+def parse_page_number_from_name(name: str, fallback: int) -> int:
+    match = re.search(r"page[-_](\d+)", Path(name).stem, flags=re.IGNORECASE)
+    if not match:
+        return fallback
+    try:
+        return max(0, int(match.group(1)) - 1)
+    except ValueError:
+        return fallback
+
+
+def s3_input_page_from_key(key: str, input_prefix: str, fallback_index: int) -> Optional[S3InputPage]:
+    rel = relative_s3_key(key, input_prefix).replace("\\", "/")
+    parts = [p for p in rel.split("/") if p]
+    if len(parts) < 4:
+        return None
+    if parts[0] != "documents" or parts[2] != "pages":
+        return None
+    page_name = parts[-1]
+    if not is_image_key(page_name):
+        return None
+    return S3InputPage(
+        key=key,
+        ocr_document_id=parts[1],
+        page_name=page_name,
+        page_num=parse_page_number_from_name(page_name, fallback_index),
+    )
+
+
+def list_s3_v2_input_pages(s3: Any, bucket: str, input_prefix: str) -> List[S3InputPage]:
+    documents_prefix = join_s3_key(input_prefix, "documents")
+    image_keys = [k for k in s3_list_keys(s3, bucket, documents_prefix) if is_image_key(k)]
+    pages: List[S3InputPage] = []
+    for idx, key in enumerate(image_keys):
+        page = s3_input_page_from_key(key, input_prefix, fallback_index=idx)
+        if page is not None:
+            pages.append(page)
+    return sorted(pages, key=lambda p: (p.ocr_document_id, p.page_num, p.page_name, p.key))
+
+
+def group_pages_by_document(pages: Sequence[S3InputPage]) -> Dict[str, List[S3InputPage]]:
+    grouped: Dict[str, List[S3InputPage]] = {}
+    for page in pages:
+        grouped.setdefault(page.ocr_document_id, []).append(page)
+    return grouped
 
 
 def list_images(img_dir: str) -> List[Path]:
@@ -402,7 +463,9 @@ def run_local(input_dir: str, output_dir: str, settings: OcrSettings, limit: Opt
 
     client = make_openai_client(settings)
     out_dir = Path(output_dir)
-    pages_out_dir = out_dir / "pages"
+    ocr_document_id = "doc-001-local"
+    document_out_dir = out_dir / "documents" / ocr_document_id
+    pages_out_dir = document_out_dir / "pages"
     manifest_pages: List[Dict[str, Any]] = []
 
     for idx, img_path in enumerate(pages):
@@ -416,19 +479,37 @@ def run_local(input_dir: str, output_dir: str, settings: OcrSettings, limit: Opt
         result["copied_input_image"] = str(copied_image)
         manifest_pages.append(result)
 
-    manifest_payload = {
-            "version": "ocr-artifacts/v1",
-            "mode": "local",
-            "created_at_utc": now_utc_iso(),
-            "input_dir": input_dir,
-            "output_dir": output_dir,
-            "settings": settings.to_json(),
-            "pages_dir": str(pages_out_dir),
-            "source_dir": str(out_dir / "source"),
-            "pages": manifest_pages,
-            "stop_requested": _STOP_REQUESTED,
-        }
+    document_manifest = {
+        "version": "ocr-artifacts/v2",
+        "artifactVersion": "ocr-artifacts/v2",
+        "mode": "local",
+        "created_at_utc": now_utc_iso(),
+        "ocrDocumentId": ocr_document_id,
+        "documentId": ocr_document_id,
+        "input_dir": input_dir,
+        "output_dir": str(document_out_dir),
+        "pages_dir": str(pages_out_dir),
+        "source_dir": str(document_out_dir / "source"),
+        "settings": settings.to_json(),
+        "pages": manifest_pages,
+        "stop_requested": _STOP_REQUESTED,
+    }
 
+    manifest_payload = {
+        "version": "ocr-artifacts/v2",
+        "artifactVersion": "ocr-artifacts/v2",
+        "mode": "local",
+        "created_at_utc": now_utc_iso(),
+        "input_dir": input_dir,
+        "output_dir": output_dir,
+        "output_documents_dir": str(out_dir / "documents"),
+        "documentCount": 1,
+        "documents": [document_manifest],
+        "settings": settings.to_json(),
+        "stop_requested": _STOP_REQUESTED,
+    }
+
+    write_json(document_out_dir / "_job.json", document_manifest)
     write_json(out_dir / "_job.json", manifest_payload)
     write_json(out_dir / "run_manifest.json", manifest_payload)
 
@@ -516,9 +597,27 @@ def s3_copy_object(s3: Any, bucket: str, source_key: str, target_key: str, conte
     s3.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": source_key}, Key=target_key, **extra_args)
 
 
-def copy_input_source_pdfs(s3: Any, bucket: str, input_prefix: str, output_prefix: str) -> Tuple[List[str], List[str]]:
-    input_source_prefix = join_s3_key(input_prefix, "source")
-    output_source_prefix = join_s3_key(output_prefix, "source")
+def s3_get_json_optional(s3: Any, bucket: str, key: str) -> Optional[Dict[str, Any]]:
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        code = str(exc.response.get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"}:
+            return None
+        raise
+    body = obj["Body"].read().decode("utf-8")
+    return json.loads(body)
+
+
+def copy_input_document_sources(
+    s3: Any,
+    bucket: str,
+    input_prefix: str,
+    output_prefix: str,
+    ocr_document_id: str,
+) -> Tuple[List[str], List[str]]:
+    input_source_prefix = join_s3_key(input_prefix, "documents", ocr_document_id, "source")
+    output_source_prefix = join_s3_key(output_prefix, "documents", ocr_document_id, "source")
     pdf_keys = [
         k for k in s3_list_keys(s3, bucket, input_source_prefix)
         if Path(k).suffix.lower() == ".pdf"
@@ -587,14 +686,19 @@ def run_s3(
     print(f"[s3] state_prefix: {state_prefix}", flush=True)
     print(f"[s3] endpoint_url: {endpoint_url or '<default>'}", flush=True)
 
-    all_keys = [k for k in s3_list_keys(s3, bucket, input_prefix) if is_image_key(k)]
-    total_available_input_images = len(all_keys)
+    all_pages = list_s3_v2_input_pages(s3, bucket, input_prefix)
+    total_available_input_images = len(all_pages)
     selected_limit = max(0, limit) if limit is not None else None
-    keys = all_keys[:selected_limit] if selected_limit is not None else all_keys
+    pages = all_pages[:selected_limit] if selected_limit is not None else all_pages
     limit_applied = selected_limit is not None and selected_limit < total_available_input_images
 
-    if not keys:
-        raise FileNotFoundError(f"No image objects found at s3://{bucket}/{input_prefix}")
+    if not pages:
+        raise FileNotFoundError(
+            f"No v2 input page images found at s3://{bucket}/{join_s3_key(input_prefix, 'documents')}"
+        )
+
+    all_document_ids = sorted(group_pages_by_document(all_pages).keys())
+    selected_document_ids = sorted(group_pages_by_document(pages).keys())
 
     download_dir.mkdir(parents=True, exist_ok=True)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -604,10 +708,14 @@ def run_s3(
         bucket,
         join_s3_key(state_prefix, "worker-started.json"),
         {
+            "version": "ocr-artifacts/v2",
+            "artifactVersion": "ocr-artifacts/v2",
             "created_at_utc": now_utc_iso(),
             "host": os.uname().nodename if hasattr(os, "uname") else "unknown",
             "total_available_input_images": total_available_input_images,
-            "selected_input_images": len(keys),
+            "selected_input_images": len(pages),
+            "documentCount": len(all_document_ids),
+            "selectedDocumentCount": len(selected_document_ids),
             "limit": limit,
             "limit_applied": limit_applied,
             "settings": settings.to_json(),
@@ -618,24 +726,37 @@ def run_s3(
     skipped = 0
     failed = 0
     manifest_pages: List[Dict[str, Any]] = []
+    manifest_pages_by_document: Dict[str, List[Dict[str, Any]]] = {doc_id: [] for doc_id in selected_document_ids}
 
-    for idx, key in enumerate(keys, start=1):
+    for idx, page in enumerate(pages, start=1):
         if _STOP_REQUESTED:
             print("[s3] stop requested before next page.", flush=True)
             break
 
-        page_id = page_id_from_key(key, input_prefix)
-        done_key = join_s3_key(state_prefix, f"{page_id}.done.json")
-        failed_key = join_s3_key(state_prefix, f"{page_id}.failed.json")
+        key = page.key
+        ocr_document_id = page.ocr_document_id
+        page_id = safe_stem(page.page_name)
+        done_key = join_s3_key(state_prefix, "documents", ocr_document_id, f"{page_id}.done.json")
+        failed_key = join_s3_key(state_prefix, "documents", ocr_document_id, f"{page_id}.failed.json")
         heartbeat_key = join_s3_key(state_prefix, "worker-heartbeat.json")
+        page_output_prefix = join_s3_key(output_prefix, "documents", ocr_document_id, "pages")
 
         if not force and s3_key_exists(s3, bucket, done_key):
             skipped += 1
-            manifest_pages.append({"status": "skipped", "input_key": key, "page_id": page_id, "page_num": idx - 1})
-            print(f"[s3] [{idx}/{len(keys)}] skip done: {key}", flush=True)
+            skipped_item = {
+                "status": "skipped",
+                "input_key": key,
+                "ocrDocumentId": ocr_document_id,
+                "page_id": page_id,
+                "page_num": page.page_num,
+                "output_prefix": page_output_prefix,
+            }
+            manifest_pages.append(skipped_item)
+            manifest_pages_by_document.setdefault(ocr_document_id, []).append(skipped_item)
+            print(f"[s3] [{idx}/{len(pages)}] skip done: {key}", flush=True)
             continue
 
-        print(f"[s3] [{idx}/{len(keys)}] processing: {key}", flush=True)
+        print(f"[s3] [{idx}/{len(pages)}] processing: {key}", flush=True)
         s3_put_json(
             s3,
             bucket,
@@ -643,17 +764,18 @@ def run_s3(
             {
                 "updated_at_utc": now_utc_iso(),
                 "current_input_key": key,
+                "current_ocr_document_id": ocr_document_id,
                 "current_page_id": page_id,
                 "index": idx,
-                "total": len(keys),
+                "total": len(pages),
                 "processed": processed,
                 "skipped": skipped,
                 "failed": failed,
             },
         )
 
-        local_page_dir = work_dir / page_id
-        local_input = local_page_dir / "in" / Path(key).name
+        local_page_dir = work_dir / ocr_document_id / page_id
+        local_input = local_page_dir / "in" / page.page_name
         local_output_dir = local_page_dir / "out"
         if not keep_local:
             clean_dir(local_page_dir)
@@ -663,18 +785,21 @@ def run_s3(
         started_at = now_utc_iso()
         try:
             s3.download_file(bucket, key, str(local_input))
-            page_result = process_image(client, local_input, local_output_dir, settings, page_num=idx - 1)
-            copied_input_image = local_output_dir / Path(key).name
+            page_result = process_image(client, local_input, local_output_dir, settings, page_num=page.page_num)
+            copied_input_image = local_output_dir / page.page_name
             shutil.copy2(local_input, copied_input_image)
             page_result["copied_input_image"] = str(copied_input_image)
-            page_output_prefix = join_s3_key(output_prefix, "pages")
             uploaded_keys = upload_directory(s3, bucket, local_output_dir, page_output_prefix)
 
             done_payload = {
+                "version": "ocr-artifacts/v2",
+                "artifactVersion": "ocr-artifacts/v2",
                 "status": "done",
                 "input_bucket": bucket,
                 "input_key": key,
+                "ocrDocumentId": ocr_document_id,
                 "page_id": page_id,
+                "page_num": page.page_num,
                 "output_prefix": page_output_prefix,
                 "uploaded_keys": uploaded_keys,
                 "started_at_utc": started_at,
@@ -684,24 +809,30 @@ def run_s3(
             }
             # The done marker is written last. This is the resume boundary.
             s3_put_json(s3, bucket, done_key, done_payload)
-            manifest_pages.append({
+            done_item = {
                 "status": "done",
                 "input_key": key,
+                "ocrDocumentId": ocr_document_id,
                 "page_id": page_id,
-                "page_num": idx - 1,
+                "page_num": page.page_num,
                 "output_prefix": page_output_prefix,
                 "uploaded_keys": uploaded_keys,
                 "result": page_result,
-            })
+            }
+            manifest_pages.append(done_item)
+            manifest_pages_by_document.setdefault(ocr_document_id, []).append(done_item)
             processed += 1
             print(f"[s3] done marker: s3://{bucket}/{done_key}", flush=True)
 
         except Exception as exc:
             failed += 1
             failure_payload = {
+                "version": "ocr-artifacts/v2",
+                "artifactVersion": "ocr-artifacts/v2",
                 "status": "failed",
                 "input_bucket": bucket,
                 "input_key": key,
+                "ocrDocumentId": ocr_document_id,
                 "page_id": page_id,
                 "started_at_utc": started_at,
                 "failed_at_utc": now_utc_iso(),
@@ -720,19 +851,76 @@ def run_s3(
                 except Exception as cleanup_exc:
                     print(f"[s3] cleanup warning: {cleanup_exc}", flush=True)
 
-    source_pdf_input_keys, source_pdf_output_keys = copy_input_source_pdfs(s3, bucket, input_prefix, output_prefix)
+    source_pdf_input_keys: List[str] = []
+    source_pdf_output_keys: List[str] = []
+    document_manifests: List[Dict[str, Any]] = []
+
+    for ocr_document_id in selected_document_ids:
+        input_document_manifest_key = join_s3_key(input_prefix, "documents", ocr_document_id, "document.json")
+        input_document_manifest = s3_get_json_optional(s3, bucket, input_document_manifest_key) or {}
+        document_source_input_keys, document_source_output_keys = copy_input_document_sources(
+            s3,
+            bucket,
+            input_prefix,
+            output_prefix,
+            ocr_document_id,
+        )
+        source_pdf_input_keys.extend(document_source_input_keys)
+        source_pdf_output_keys.extend(document_source_output_keys)
+
+        document_pages = manifest_pages_by_document.get(ocr_document_id, [])
+        document_status = "done" if failed == 0 and not _STOP_REQUESTED and not limit_applied else "partial"
+        document_manifest = {
+            "version": "ocr-artifacts/v2",
+            "artifactVersion": "ocr-artifacts/v2",
+            "status": document_status,
+            "mode": "s3",
+            "created_at_utc": now_utc_iso(),
+            "bucket": bucket,
+            "job_prefix": job_prefix,
+            "input_prefix": join_s3_key(input_prefix, "documents", ocr_document_id),
+            "output_prefix": join_s3_key(output_prefix, "documents", ocr_document_id),
+            "output_pages_prefix": join_s3_key(output_prefix, "documents", ocr_document_id, "pages"),
+            "output_source_prefix": join_s3_key(output_prefix, "documents", ocr_document_id, "source"),
+            "state_prefix": join_s3_key(state_prefix, "documents", ocr_document_id),
+            "ocrDocumentId": ocr_document_id,
+            "documentId": ocr_document_id,
+            "inputDocumentManifestKey": input_document_manifest_key,
+            "inputDocumentManifest": input_document_manifest,
+            "originalFilename": input_document_manifest.get("originalFilename"),
+            "sourcePdfFileName": input_document_manifest.get("sourcePdfFileName"),
+            "sourcePdfSHA256": input_document_manifest.get("sourcePdfSHA256"),
+            "source_pdf_input_keys": document_source_input_keys,
+            "source_pdf_output_keys": document_source_output_keys,
+            "pages": document_pages,
+            "settings": settings.to_json(),
+            "stop_requested": _STOP_REQUESTED,
+            "limit": limit,
+            "limit_applied": limit_applied,
+        }
+        s3_put_json(
+            s3,
+            bucket,
+            join_s3_key(output_prefix, "documents", ocr_document_id, "_job.json"),
+            document_manifest,
+        )
+        document_manifests.append(document_manifest)
 
     finished_at_utc = now_utc_iso()
-    job_status = "done" if failed == 0 and not _STOP_REQUESTED and not limit_applied and processed + skipped == len(keys) else "partial"
+    job_status = "done" if failed == 0 and not _STOP_REQUESTED and not limit_applied and processed + skipped == len(pages) else "partial"
 
     finished_payload = {
+        "version": "ocr-artifacts/v2",
+        "artifactVersion": "ocr-artifacts/v2",
         "finished_at_utc": finished_at_utc,
         "processed": processed,
         "skipped": skipped,
         "failed": failed,
         "stop_requested": _STOP_REQUESTED,
         "total_available_input_images": total_available_input_images,
-        "selected_input_images": len(keys),
+        "selected_input_images": len(pages),
+        "documentCount": len(all_document_ids),
+        "selectedDocumentCount": len(selected_document_ids),
         "limit": limit,
         "limit_applied": limit_applied,
     }
@@ -745,7 +933,8 @@ def run_s3(
     )
 
     job_manifest = {
-        "version": "ocr-artifacts/v1",
+        "version": "ocr-artifacts/v2",
+        "artifactVersion": "ocr-artifacts/v2",
         "status": job_status,
         "mode": "s3",
         "created_at_utc": finished_at_utc,
@@ -753,11 +942,9 @@ def run_s3(
         "bucket": bucket,
         "job_prefix": job_prefix,
         "input_prefix": input_prefix,
-        "input_pages_prefix": join_s3_key(input_prefix, "pages"),
-        "input_source_prefix": join_s3_key(input_prefix, "source"),
+        "input_documents_prefix": join_s3_key(input_prefix, "documents"),
         "output_prefix": output_prefix,
-        "output_pages_prefix": join_s3_key(output_prefix, "pages"),
-        "output_source_prefix": join_s3_key(output_prefix, "source"),
+        "output_documents_prefix": join_s3_key(output_prefix, "documents"),
         "state_prefix": state_prefix,
         "source_pdf_input_keys": source_pdf_input_keys,
         "source_pdf_output_keys": source_pdf_output_keys,
@@ -766,15 +953,20 @@ def run_s3(
         "failed": failed,
         "stop_requested": _STOP_REQUESTED,
         "total_available_input_images": total_available_input_images,
-        "selected_input_images": len(keys),
+        "selected_input_images": len(pages),
+        "documentCount": len(all_document_ids),
+        "selectedDocumentCount": len(selected_document_ids),
+        "documentIds": all_document_ids,
+        "selectedDocumentIds": selected_document_ids,
         "limit": limit,
         "limit_applied": limit_applied,
         "settings": settings.to_json(),
+        "documents": document_manifests,
         "pages": manifest_pages,
     }
     s3_put_json(s3, bucket, join_s3_key(output_prefix, "_job.json"), job_manifest)
 
-    if failed == 0 and not _STOP_REQUESTED and not limit_applied and processed + skipped == len(keys):
+    if failed == 0 and not _STOP_REQUESTED and not limit_applied and processed + skipped == len(pages):
         job_done_payload = dict(finished_payload)
         job_done_payload["status"] = "done"
         s3_put_json(
