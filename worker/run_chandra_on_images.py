@@ -48,6 +48,8 @@ DEFAULT_PROMPT_TYPE = "ocr_layout"
 DEFAULT_MAX_SIDE = 1400
 DEFAULT_MAX_NEW_TOKENS = 1500
 IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"}
+ARTIFACT_VERSION = "ocr-artifacts/v2"
+OUTPUT_LAYOUT = "output/documents/<ocrDocumentId>/pages"
 
 _STOP_REQUESTED = False
 
@@ -685,6 +687,9 @@ def run_s3(
     print(f"[s3] output_prefix: {output_prefix}", flush=True)
     print(f"[s3] state_prefix: {state_prefix}", flush=True)
     print(f"[s3] endpoint_url: {endpoint_url or '<default>'}", flush=True)
+    print(f"[s3] artifact_version: {ARTIFACT_VERSION}", flush=True)
+    print(f"[s3] expected_input_layout: {join_s3_key(input_prefix, 'documents', '<ocrDocumentId>', 'pages')}", flush=True)
+    print(f"[s3] expected_output_layout: {join_s3_key(output_prefix, 'documents', '<ocrDocumentId>', 'pages')}", flush=True)
 
     all_pages = list_s3_v2_input_pages(s3, bucket, input_prefix)
     total_available_input_images = len(all_pages)
@@ -693,8 +698,17 @@ def run_s3(
     limit_applied = selected_limit is not None and selected_limit < total_available_input_images
 
     if not pages:
+        legacy_pages_prefix = join_s3_key(input_prefix, "pages")
+        legacy_page_count = len([k for k in s3_list_keys(s3, bucket, legacy_pages_prefix) if is_image_key(k)])
+        hint = ""
+        if legacy_page_count:
+            hint = (
+                f" Found {legacy_page_count} legacy input image(s) under "
+                f"s3://{bucket}/{legacy_pages_prefix}. This worker expects ocr-artifacts/v2: "
+                "input/documents/<ocrDocumentId>/pages/*.png."
+            )
         raise FileNotFoundError(
-            f"No v2 input page images found at s3://{bucket}/{join_s3_key(input_prefix, 'documents')}"
+            f"No v2 input page images found at s3://{bucket}/{join_s3_key(input_prefix, 'documents')}." + hint
         )
 
     all_document_ids = sorted(group_pages_by_document(all_pages).keys())
@@ -709,7 +723,9 @@ def run_s3(
         join_s3_key(state_prefix, "worker-started.json"),
         {
             "version": "ocr-artifacts/v2",
-            "artifactVersion": "ocr-artifacts/v2",
+            "artifactVersion": ARTIFACT_VERSION,
+            "workerScriptArtifactVersion": ARTIFACT_VERSION,
+            "workerOutputLayout": OUTPUT_LAYOUT,
             "created_at_utc": now_utc_iso(),
             "host": os.uname().nodename if hasattr(os, "uname") else "unknown",
             "total_available_input_images": total_available_input_images,
@@ -790,6 +806,12 @@ def run_s3(
             shutil.copy2(local_input, copied_input_image)
             page_result["copied_input_image"] = str(copied_input_image)
             uploaded_keys = upload_directory(s3, bucket, local_output_dir, page_output_prefix)
+            copied_input_image_key = join_s3_key(page_output_prefix, page.page_name)
+            if copied_input_image_key not in uploaded_keys:
+                print(
+                    f"[s3] warning: expected copied page image was not uploaded: s3://{bucket}/{copied_input_image_key}",
+                    flush=True,
+                )
 
             done_payload = {
                 "version": "ocr-artifacts/v2",
@@ -802,6 +824,7 @@ def run_s3(
                 "page_num": page.page_num,
                 "output_prefix": page_output_prefix,
                 "uploaded_keys": uploaded_keys,
+                "copied_input_image_key": copied_input_image_key,
                 "started_at_utc": started_at,
                 "completed_at_utc": now_utc_iso(),
                 "result": page_result,
@@ -817,6 +840,7 @@ def run_s3(
                 "page_num": page.page_num,
                 "output_prefix": page_output_prefix,
                 "uploaded_keys": uploaded_keys,
+                "copied_input_image_key": copied_input_image_key,
                 "result": page_result,
             }
             manifest_pages.append(done_item)
@@ -872,7 +896,9 @@ def run_s3(
         document_status = "done" if failed == 0 and not _STOP_REQUESTED and not limit_applied else "partial"
         document_manifest = {
             "version": "ocr-artifacts/v2",
-            "artifactVersion": "ocr-artifacts/v2",
+            "artifactVersion": ARTIFACT_VERSION,
+            "workerScriptArtifactVersion": ARTIFACT_VERSION,
+            "workerOutputLayout": OUTPUT_LAYOUT,
             "status": document_status,
             "mode": "s3",
             "created_at_utc": now_utc_iso(),
@@ -934,7 +960,9 @@ def run_s3(
 
     job_manifest = {
         "version": "ocr-artifacts/v2",
-        "artifactVersion": "ocr-artifacts/v2",
+        "artifactVersion": ARTIFACT_VERSION,
+        "workerScriptArtifactVersion": ARTIFACT_VERSION,
+        "workerOutputLayout": OUTPUT_LAYOUT,
         "status": job_status,
         "mode": "s3",
         "created_at_utc": finished_at_utc,
@@ -1046,6 +1074,9 @@ def main() -> int:
     settings = settings_from_args(args)
     
     print("Chandra OCR worker starting...")
+    print(f"Worker artifact version: {ARTIFACT_VERSION}")
+    print(f"Worker output layout: {OUTPUT_LAYOUT}")
+    print(f"Worker script path: {Path(__file__).resolve()}")
 
     if args.s3_bucket:
         if not args.s3_job_prefix and not args.s3_input_prefix:
